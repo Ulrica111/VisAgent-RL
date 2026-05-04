@@ -1,0 +1,13 @@
+# PyVision-RL Memory Agent 依赖
+# 在 AutoDL 上安装：pip install -r requirements.txt
+
+# 图片处理
+Pillow>=10.0.0
+
+# HTTP 请求（调用 vLLM 接口）
+requests>=2.31.0
+
+# 数值计算（可选，用于后续语义检索）
+numpy>=1.24.0
+
+# 标准库已包含：json, hashlib, re, math, collections, pathlib, dataclasses, logging

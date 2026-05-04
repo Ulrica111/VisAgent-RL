@@ -1,0 +1,191 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from collections import defaultdict
+import os
+import json
+
+import torch
+
+from verl import DataProto
+from verl.utils.reward_score import _default_compute_score
+
+
+def _resolve_llm_as_a_judge_config() -> dict:
+    """Merge JSON config (optional) with env overrides."""
+    cfg_path = os.getenv("LLM_AS_A_JUDGE_CONFIG_PATH")
+    base_override = os.getenv("LLM_AS_A_JUDGE_BASE")
+
+    if cfg_path:
+        resolved = os.path.expanduser(cfg_path)
+        if not os.path.isfile(resolved):
+            raise FileNotFoundError(
+                f"LLM_AS_A_JUDGE_CONFIG_PATH is not a file: {resolved!r}"
+            )
+        with open(resolved, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    elif base_override:
+        cfg = {
+            "base_url": base_override.rstrip("/"),
+            "api_key": os.getenv("LLM_AS_A_JUDGE_API_KEY", ""),
+            "model_name": os.getenv("LLM_AS_A_JUDGE_MODEL", "default"),
+        }
+    else:
+        raise ValueError(
+            "Set LLM_AS_A_JUDGE_CONFIG_PATH to a JSON file with keys base_url, api_key, model_name "
+            "(see PyVision-RL/judge_config.json), or set LLM_AS_A_JUDGE_BASE and optionally "
+            "LLM_AS_A_JUDGE_API_KEY / LLM_AS_A_JUDGE_MODEL."
+        )
+
+    if base_override:
+        cfg["base_url"] = base_override.rstrip("/")
+
+    for required in ("base_url", "api_key", "model_name"):
+        if required not in cfg:
+            cfg[required] = ""
+
+    return cfg
+
+class NaiveRewardManager:
+    """The reward manager."""
+
+    def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source") -> None:
+        self.tokenizer = tokenizer
+        self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
+        self.compute_score = compute_score or _default_compute_score
+        self.reward_fn_key = reward_fn_key
+
+        self.step_cnt = 0
+
+        self.llm_as_a_judge_config = _resolve_llm_as_a_judge_config()
+        self.llm_as_a_judge_base_url = self.llm_as_a_judge_config["base_url"]
+        self.llm_as_a_judge_model_name = self.llm_as_a_judge_config["model_name"]
+
+
+    def __call__(self, data: DataProto, return_dict=False):
+        """We will expand this function gradually based on the available datasets"""
+
+        # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
+        if "rm_scores" in data.batch.keys():
+            if return_dict:
+                return {"reward_tensor": data.batch["rm_scores"]}
+            else:
+                return data.batch["rm_scores"]
+
+        reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+        reward_extra_info = defaultdict(list)
+
+        action_or_attn_mask = data.batch['action_mask'] if 'action_mask' in data.batch.keys() else data.batch['attention_mask']
+        # if 'env_reward' in data.batch.keys():
+        #     reward_tensor += data.batch['env_reward']
+        #     print(f' [DEBUG reward] mean={reward_tensor.mean().item()}, min={reward_tensor.min().item()}, max={reward_tensor.max().item()}')
+
+##############################################################################################################################################################
+        if 'env_reward' in data.batch.keys():
+            env_reward_tensor = data.batch['env_reward']
+            # print(f' [DEBUG reward] mean={reward_tensor.mean().item()}, min={reward_tensor.min().item()}, max={reward_tensor.max().item()}')
+##############################################################################################################################################################
+
+        already_print_data_sources = {}
+
+        for i in range(len(data)):
+            data_item = data[i]  # DataProtoItem
+
+            prompt_ids = data_item.batch["prompts"]
+
+            prompt_length = prompt_ids.shape[-1]
+
+            valid_prompt_length = data_item.batch["attention_mask"][:prompt_length].sum()
+            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+
+            response_ids = data_item.batch["responses"]
+            valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
+
+            # decode
+            prompt_str = self.tokenizer.decode(valid_prompt_ids)
+            response_str = self.tokenizer.decode(valid_response_ids)
+
+            ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
+
+            data_source = data_item.non_tensor_batch[self.reward_fn_key]
+
+            extra_info = data_item.non_tensor_batch.get("extra_info", None)
+
+            ability = data_item.non_tensor_batch.get("ability", None)
+
+            uid = data_item.non_tensor_batch.get("uid", None)
+
+            score = self.compute_score(
+                data_source=data_source,
+                solution_str=response_str,
+                ground_truth=ground_truth,
+                extra_info=extra_info,
+                llm_as_a_judge_config=self.llm_as_a_judge_config
+            )
+
+            # print(f"#################### score: {score}")
+
+#############################################################################################################
+            if score['is_answer_right']:
+                reward_tensor[i] += env_reward_tensor[i]
+##############################################################################################################
+
+            if isinstance(score, dict):
+                reward = score["score"]
+                # Store the information including original reward
+                for key, value in score.items():
+                    if key != "score":
+                        reward_extra_info[key].append(value)
+                reward_extra_info['acc_score'].append(score["score"])
+                reward_extra_info['ground_truth'].append(ground_truth)
+                reward_extra_info['data_source'].append(data_source)
+                reward_extra_info['ability'].append(ability)
+                reward_extra_info['uid'].append(uid)
+            else:
+                reward = score
+                reward_extra_info['acc_score'].append(score)
+                reward_extra_info['ground_truth'].append(ground_truth)
+                reward_extra_info['data_source'].append(data_source)
+                reward_extra_info['ability'].append(ability)
+                reward_extra_info['uid'].append(uid)
+
+            reward_tensor[i, valid_response_length - 1] += reward
+
+            # eos_idx = torch.nonzero(action_or_attn_mask[i, prompt_length: prompt_length + valid_response_length])[-1]
+            # reward_tensor[i, eos_idx] = score
+
+            if data_source not in already_print_data_sources:
+                already_print_data_sources[data_source] = 0
+
+            if already_print_data_sources[data_source] < self.num_examine:
+                already_print_data_sources[data_source] += 1
+                print("[prompt]", prompt_str)
+                print("[response]", response_str)
+                print("[ground_truth]", ground_truth)
+                if isinstance(score, dict):
+                    for key, value in score.items():
+                        print(f"[{key}]", value)
+                else:
+                    print("[score]", score)
+
+            self.step_cnt += 1
+
+        if return_dict:
+            return {
+                "reward_tensor": reward_tensor,
+                "reward_extra_info": reward_extra_info,
+            }
+        else:
+            return reward_tensor

@@ -1,0 +1,518 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Metrics related to the PPO trainer.
+"""
+
+from collections import defaultdict
+from collections import Counter
+from functools import partial
+from typing import Any, Callable, Dict, List
+
+import numpy as np
+import torch
+
+from verl import DataProto
+
+
+def reduce_metrics(metrics: Dict[str, List[Any]]) -> Dict[str, Any]:
+    for key, val in metrics.items():
+        metrics[key] = np.mean(val)
+    return metrics
+
+
+def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
+    response_length = batch.batch["responses"].shape[-1]
+
+    prompt_mask = batch.batch["attention_mask"][:, :-response_length]
+    response_mask = batch.batch["attention_mask"][:, -response_length:]
+
+    prompt_length = prompt_mask.sum(-1).float()
+    response_length = response_mask.sum(-1).float()  # (batch_size,)
+
+    if 'action_mask' in batch.batch:
+        action_mask = batch.batch['action_mask'][:, -batch.batch['responses'].shape[-1]:]
+        obs_mask = response_mask * (1 - action_mask)
+        obs_length = obs_mask.sum(-1).float()
+    else:
+        obs_length = torch.zeros_like(response_length)
+    response_length -= obs_length
+
+    return dict(
+        response_mask=response_mask,
+        prompt_length=prompt_length,
+        response_length=response_length,
+        obs_length=obs_length,
+    )
+
+def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str, Any]:
+    # TODO: add response length
+    sample_level_stds = batch.non_tensor_batch["sample_level_stds"]
+    sequence_score = batch.batch["token_level_scores"].sum(-1)
+    sequence_reward = batch.batch["token_level_rewards"].sum(-1)
+
+    is_correct_list = batch.non_tensor_batch["is_answer_right"]
+
+    num_correct = sum([1 if _ else 0 for _ in is_correct_list])
+
+    acc_batch = num_correct / len(is_correct_list)
+
+    # data source distribution computation
+    data_source_list = batch.non_tensor_batch["data_source"]
+
+    data_source_counts = Counter(data_source_list)
+    total_data_source = len(data_source_list)
+
+    # 构造一个字典，value 为比例
+    source_ratios = {k: v / total_data_source for k, v in data_source_counts.items()}
+
+    # ability distribution computation
+    data_ability_list = batch.non_tensor_batch["ability"]
+
+    data_ability_counts = Counter(data_ability_list)
+    total_data_ability = len(data_ability_list)
+
+    # 构造一个字典，value 为比例
+    ability_ratios = {k: v / total_data_ability for k, v in data_ability_counts.items()}
+
+    # 使用 wandb.Histogram 记录比例分布
+    # wandb.log({"source_ratio_per_step": wandb.Histogram(list(source_ratios.values()))})
+
+    uid_list = batch.non_tensor_batch["uid"]
+
+    # 假设 uid 和 reward 已定义
+    # uid: [512,]，reward: [512,]
+
+    # 步骤1：计算唯一 uid 的数量（即 64）
+    unique_uids = np.unique(uid_list)
+    unique_uid_count = len(unique_uids)
+
+    # 步骤3：按 uid 分组并 reshape
+    _, inverse_indices = np.unique(uid_list, return_inverse=True)
+
+    acc_per_group_list = []
+
+    for i in range(unique_uid_count):
+        mask = (inverse_indices == i)
+        sequence_score_one_group = sequence_score[mask]
+        # reward_reformed[i] = sequence_score_one_group
+        correct_num_one_group = [1 if _ > 0 else 0 for _ in sequence_score_one_group]
+        acc_one_group = sum(correct_num_one_group) / len(sequence_score_one_group)
+        acc_per_group_list.append(acc_one_group)
+
+    per_group_one_ratio = sum([1 if _ == 1.0 else 0 for _ in acc_per_group_list]) / len(acc_per_group_list)
+    per_group_zero_ratio = sum([1 if _ == 0.0 else 0 for _ in acc_per_group_list]) / len(acc_per_group_list)
+
+
+    advantages = batch.batch["advantages"]
+    returns = batch.batch["returns"]
+
+    max_response_length = batch.batch["responses"].shape[-1]
+    prompt_mask = batch.batch['attention_mask'][:, :-max_response_length].bool()
+    action_or_attn_mask = batch.batch['action_mask'] if 'action_mask' in batch.batch else batch.batch['attention_mask']
+    response_mask = action_or_attn_mask[:, -max_response_length:].bool()
+
+    max_prompt_length = prompt_mask.size(-1)
+
+    response_info = _compute_response_info(batch)
+    prompt_length = response_info["prompt_length"]
+    response_length = response_info["response_length"]
+    obs_length = response_info["obs_length"]
+
+    valid_adv = torch.masked_select(advantages, response_mask)
+    valid_returns = torch.masked_select(returns, response_mask)
+
+    # 计算每个样本的sequence级别的优势
+    sequence_advantages = []
+    for i in range(len(is_correct_list)):
+        # 选择当前样本的有效token的优势
+        sample_advantages = advantages[i][response_mask[i]]
+        # 计算平均优势
+        if len(sample_advantages) > 0:
+            seq_adv = torch.mean(sample_advantages).item()
+        else:
+            seq_adv = 0.0
+        sequence_advantages.append(seq_adv)
+
+    # 计算正样本中的优势分布
+    pos_sample_indices = [i for i, is_correct in enumerate(is_correct_list) if is_correct]
+    pos_sample_count = len(pos_sample_indices)
+    
+    pos_sample_pos_adv_num = 0
+    pos_sample_neg_adv_num = 0
+    
+    if pos_sample_count > 0:
+        for idx in pos_sample_indices:
+            if sequence_advantages[idx] > 0:
+                pos_sample_pos_adv_num += 1
+            elif sequence_advantages[idx] < 0:
+                pos_sample_neg_adv_num += 1
+        
+        pos_sample_pos_adv_ratio = pos_sample_pos_adv_num / pos_sample_count
+        pos_sample_neg_adv_ratio = pos_sample_neg_adv_num / pos_sample_count
+    else:
+        pos_sample_pos_adv_ratio = 0.0
+        pos_sample_neg_adv_ratio = 0.0
+
+    if use_critic:
+        values = batch.batch["values"]
+        valid_values = torch.masked_select(values, response_mask)
+        return_diff_var = torch.var(valid_returns - valid_values)
+        return_var = torch.var(valid_returns)
+
+    # 检查是否有tool_cnt数据
+    has_tool_data = 'tool_cnt' in batch.batch
+    tool_cnt_tensor = None
+    if has_tool_data:
+        tool_cnt_tensor = batch.batch['tool_cnt']
+
+    # 按data source分组计算指标
+    data_source_metrics = {}
+    for source in data_source_counts.keys():
+        # 获取当前source的mask
+        source_mask = torch.tensor([ds == source for ds in data_source_list], device=sequence_score.device)
+        # 创建一个与advantages形状相同的source mask
+        source_mask_2d = source_mask.unsqueeze(1).expand_as(advantages)
+        
+        # 计算每个sequence的adv和reward
+        seq_rewards = sequence_reward  # 已经是sequence级别的reward
+        sample_level_stds_tensor = torch.tensor(sample_level_stds)
+
+        
+        # 获取当前source的指标
+        source_advantages = torch.masked_select(advantages, source_mask_2d & response_mask)
+        source_seq_rewards = torch.masked_select(seq_rewards, source_mask)
+        source_sample_level_std = torch.masked_select(sample_level_stds_tensor, source_mask)
+        source_response_lengths = torch.masked_select(response_length, source_mask)
+        source_obs_lengths = torch.masked_select(obs_length, source_mask)
+        
+        # 计算当前source的数量
+        source_count = data_source_counts[source]
+        
+        # 计算当前source的准确率
+        source_is_correct = [is_correct_list[i] for i, ds in enumerate(data_source_list) if ds == source]
+        source_acc = sum(source_is_correct) / len(source_is_correct) if source_is_correct else 0.0
+        
+        # 计算统计量
+        if len(source_advantages) > 0:
+            data_source_metrics[f"data_source_count/{source}"] = source_count
+            data_source_metrics[f"data_source_acc/{source}"] = source_acc
+
+            data_source_metrics[f"data_source_adv/{source}/adv_mean"] = torch.mean(source_advantages).detach().item()
+            data_source_metrics[f"data_source_adv/{source}/adv_max"] = torch.max(source_advantages).detach().item()
+            data_source_metrics[f"data_source_adv/{source}/adv_min"] = torch.min(source_advantages).detach().item()
+            
+            data_source_metrics[f"data_source_reward/{source}/reward_mean"] = torch.mean(source_seq_rewards).detach().item()
+            data_source_metrics[f"data_source_reward/{source}/reward_max"] = torch.max(source_seq_rewards).detach().item()
+            data_source_metrics[f"data_source_reward/{source}/reward_min"] = torch.min(source_seq_rewards).detach().item()
+            
+            data_source_metrics[f"data_source_response_length/{source}/response_length_mean"] = torch.mean(source_response_lengths.float()).detach().item()
+            data_source_metrics[f"data_source_response_length/{source}/response_length_max"] = torch.max(source_response_lengths).detach().item()
+            data_source_metrics[f"data_source_response_length/{source}/response_length_min"] = torch.min(source_response_lengths).detach().item()
+            
+            data_source_metrics[f"data_source_obs_length/{source}/obs_length_mean"] = torch.mean(source_obs_lengths.float()).detach().item()
+            data_source_metrics[f"data_source_obs_length/{source}/obs_length_max"] = torch.max(source_obs_lengths).detach().item()
+            data_source_metrics[f"data_source_obs_length/{source}/obs_length_min"] = torch.min(source_obs_lengths).detach().item()
+
+            data_source_metrics[f"data_source_std/{source}/std_mean"] = torch.mean(source_sample_level_std.float()).detach().item()
+            data_source_metrics[f"data_source_std/{source}/std_max"] = torch.max(source_sample_level_std).detach().item()
+            data_source_metrics[f"data_source_std/{source}/std_min"] = torch.min(source_sample_level_std).detach().item()
+            
+            # 添加tool相关指标
+            if has_tool_data:
+                source_tool_cnt = torch.masked_select(tool_cnt_tensor.squeeze(), source_mask)
+                if len(source_tool_cnt) > 0:
+                    # 计算 0 的占比
+                    source_zero_ratio = (source_tool_cnt == 0).float().mean().item()
+                    # 计算 4 的占比
+                    source_max_value = torch.max(source_tool_cnt).item()
+                    source_max_ratio = (source_tool_cnt == source_max_value).float().mean().item()
+                    
+                    data_source_metrics[f"data_source_tool/{source}/tool_call_mean"] = torch.mean(source_tool_cnt).item()
+                    data_source_metrics[f"data_source_tool/{source}/tool_call_max"] = torch.max(source_tool_cnt).item()
+                    data_source_metrics[f"data_source_tool/{source}/tool_call_min"] = torch.min(source_tool_cnt).item()
+                    data_source_metrics[f"data_source_tool/{source}/tool_call_zero_ratio"] = source_zero_ratio
+                    data_source_metrics[f"data_source_tool/{source}/tool_call_max_ratio"] = source_max_ratio
+
+    metrics = {
+        # data
+        "data_static/std/min": np.min(sample_level_stds),
+        "data_static/std/mean": np.mean(sample_level_stds),
+        "data_static/std/max": np.max(sample_level_stds),
+        "data_static/pos_sample_pos_adv_num": pos_sample_pos_adv_num,
+        "data_static/pos_sample_neg_adv_num": pos_sample_neg_adv_num,
+        "data_static/pos_sample_pos_adv_ratio": pos_sample_pos_adv_ratio,
+        "data_static/pos_sample_neg_adv_ratio": pos_sample_neg_adv_ratio,
+        # score
+        "critic/acc/acc_of_this_batch": acc_batch,
+        "critic/acc/max_group_acc_of_this_batch": max(acc_per_group_list),
+        "critic/acc/min_group_acc_of_this_batch": min(acc_per_group_list),
+        "critic/acc/one_group_acc_ratio_of_this_batch": per_group_one_ratio,
+        "critic/acc/zero_group_acc_ration_of_this_batch": per_group_zero_ratio,
+        "critic/score/mean_score_of_this_batch": torch.mean(sequence_score).detach().item(),
+        "critic/score/max_score_of_this_batch": torch.max(sequence_score).detach().item(),
+        "critic/score/min_score_of_this_batch": torch.min(sequence_score).detach().item(),
+        # reward
+        "critic/rewards/mean_reward_of_this_batch": torch.mean(sequence_reward).detach().item(),
+        "critic/rewards/max_reward_of_this_batch": torch.max(sequence_reward).detach().item(),
+        "critic/rewards/min_reward_of_this_batch": torch.min(sequence_reward).detach().item(),
+        # adv
+        "critic/advantages/mean_adv_of_this_batch": torch.mean(valid_adv).detach().item(),
+        "critic/advantages/max_adv_of_this_batch": torch.max(valid_adv).detach().item(),
+        "critic/advantages/min_adv_of_this_batch": torch.min(valid_adv).detach().item(),
+        # returns
+        "critic/returns/mean_returns_of_this_batch": torch.mean(valid_returns).detach().item(),
+        "critic/returns/max_returns_of_this_batch": torch.max(valid_returns).detach().item(),
+        "critic/returns/min_returns_of_this_batch": torch.min(valid_returns).detach().item(),
+        **(
+            {
+                # values
+                "critic/values/mean": torch.mean(valid_values).detach().item(),
+                "critic/values/max": torch.max(valid_values).detach().item(),
+                "critic/values/min": torch.min(valid_values).detach().item(),
+                # vf explained var
+                "critic/vf_explained_var": (1.0 - return_diff_var / (return_var + 1e-5)).detach().item(),
+            }
+            if use_critic
+            else {}
+        ),
+        # response length
+        "response_length/mean": torch.mean(response_length).detach().item(),
+        "response_length/max": torch.max(response_length).detach().item(),
+        "response_length/min": torch.min(response_length).detach().item(),
+        "response_length/clip_ratio": torch.mean(torch.eq(response_length, max_response_length).float())
+        .detach()
+        .item(),
+
+        # obs length
+        'obs_length/mean': torch.mean(obs_length).detach().item(),
+        'obs_length/min': torch.min(obs_length).detach().item(),
+        'obs_length/max': torch.max(obs_length).detach().item(),
+
+        # prompt length
+        "prompt_length/mean": torch.mean(prompt_length).detach().item(),
+        "prompt_length/max": torch.max(prompt_length).detach().item(),
+        "prompt_length/min": torch.min(prompt_length).detach().item(),
+        "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
+    }
+    
+    # 添加各data source的指标
+    metrics.update(data_source_metrics)
+    
+    return metrics
+
+
+def compute_timing_metrics(batch: DataProto, timing_raw: Dict[str, float]) -> Dict[str, Any]:
+    response_info = _compute_response_info(batch)
+    num_prompt_tokens = torch.sum(response_info["prompt_length"]).item()
+    num_response_tokens = torch.sum(response_info["response_length"]).item()
+    num_overall_tokens = num_prompt_tokens + num_response_tokens
+
+    num_tokens_of_section = {
+        "gen": num_response_tokens,
+        **{name: num_overall_tokens for name in ["ref", "values", "adv", "update_critic", "update_actor"]},
+    }
+
+    return {
+        **{f"timing_s/{name}": value for name, value in timing_raw.items()},
+        **{
+            f"timing_per_token_ms/{name}": timing_raw[name] * 1000 / num_tokens_of_section[name]
+            for name in set(num_tokens_of_section.keys()) & set(timing_raw.keys())
+        },
+    }
+
+
+def compute_throughout_metrics(batch: DataProto, timing_raw: Dict[str, float], n_gpus: int) -> Dict[str, Any]:
+    total_num_tokens = sum(batch.meta_info["global_token_num"])
+    time = timing_raw["step"]
+    # estimated_flops, promised_flops = flops_function.estimate_flops(num_tokens, time)
+    # f'Actual TFLOPs/s/GPU​': estimated_flops/(n_gpus),
+    # f'Theoretical TFLOPs/s/GPU​': promised_flops,
+    return {
+        "perf/total_num_tokens": total_num_tokens,
+        "perf/time_per_step": time,
+        "perf/throughput": total_num_tokens / (time * n_gpus),
+    }
+
+
+def compute_agent_metrics(batch: DataProto):
+    if 'tool_cnt' not in batch.batch.keys():
+        return {}
+
+    # tool_cnt_tensor = batch.batch.pop('tool_cnt').detach().cpu()
+    tool_cnt_tensor = batch.batch['tool_cnt'].detach().cpu()
+
+    # 计算 0 的占比
+    zero_ratio = (tool_cnt_tensor == 0).float().mean().item()
+
+    # 计算 4 的占比
+    max_ratio = (tool_cnt_tensor == torch.max(tool_cnt_tensor).item()).float().mean().item()
+
+    return {
+        "agent/tool_call_mean": torch.mean(tool_cnt_tensor).item(),
+        "agent/tool_call_max": torch.max(tool_cnt_tensor).item(),
+        "agent/tool_call_min": torch.min(tool_cnt_tensor).item(),
+        "agent/tool_call_zero_ratio": zero_ratio,
+        "agent/tool_call_max_retio": max_ratio,
+    }
+
+
+def bootstrap_metric(
+    data: list[Any],
+    subset_size: int,
+    reduce_fns: list[Callable[[np.ndarray], float]],
+    n_bootstrap: int = 1000,
+    seed: int = 42,
+) -> list[tuple[float, float]]:
+    np.random.seed(seed)
+
+    bootstrap_metric_lsts = [[] for _ in range(len(reduce_fns))]
+    for _ in range(n_bootstrap):
+        bootstrap_idxs = np.random.choice(len(data), size=subset_size, replace=True)
+        bootstrap_data = [data[i] for i in bootstrap_idxs]
+        for i, reduce_fn in enumerate(reduce_fns):
+            bootstrap_metric_lsts[i].append(reduce_fn(bootstrap_data))
+    return [(np.mean(lst), np.std(lst)) for lst in bootstrap_metric_lsts]
+
+
+def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> float:
+    """
+    Calculate the majority voting metric
+    """
+    vote2vals = defaultdict(list)
+    for d in data:
+        vote2vals[d[vote_key]].append(d[val_key])
+
+    vote2cnt = {k: len(v) for k, v in vote2vals.items()}
+    maj_vote = max(vote2cnt, key=vote2cnt.get)
+
+    maj_val = vote2vals[maj_vote][0]
+
+    return maj_val
+
+
+def process_validation_metrics(
+    data_sources: list[str], sample_inputs: list[str], infos_dict: dict[str, list[Any]], seed: int = 42
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Process validation metrics into a structured format.
+
+    Args:
+        data_sources: Array of data source identifiers for each sample
+        sample_inputs: List of input prompts
+        infos_dict: variable name -> list of values for each sample
+
+    Returns:
+        dict[str, dict[str, dict[str, float]]]: data source -> variable name -> metric value
+    """
+    # Group metrics by data source, prompt and variable
+    data_src2prompt2var2vals = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for sample_idx, data_source in enumerate(data_sources):
+        prompt = sample_inputs[sample_idx]
+        var2vals = data_src2prompt2var2vals[data_source][prompt]
+        for var_name, var_vals in infos_dict.items():
+            var2vals[var_name].append(var_vals[sample_idx])
+
+    # Calculate metrics for each group
+    data_src2prompt2var2metric = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
+    for data_source, prompt2var2vals in data_src2prompt2var2vals.items():
+        for prompt, var2vals in prompt2var2vals.items():
+            for var_name, var_vals in var2vals.items():
+                if isinstance(var_vals[0], str):
+                    continue
+                metric = {}
+                n_resps = len(var_vals)
+                metric[f"mean@{n_resps}"] = np.mean(var_vals)
+                metric[f"std@{n_resps}"] = np.std(var_vals)
+
+                ns = []
+                n = 2
+                while n < n_resps:
+                    ns.append(n)
+                    n *= 2
+                ns.append(n_resps)
+
+                for n in ns:
+                    # Best/Worst-of-N
+                    [(bon_mean, bon_std), (won_mean, won_std)] = bootstrap_metric(
+                        data=var_vals, subset_size=n, reduce_fns=[np.max, np.min], seed=seed
+                    )
+                    metric[f"best@{n}/mean"], metric[f"best@{n}/std"] = bon_mean, bon_std
+                    metric[f"worst@{n}/mean"], metric[f"worst@{n}/std"] = won_mean, won_std
+                    # Majority voting
+                    if var2vals.get("pred", None) is not None:
+                        vote_data = [{"val": val, "pred": pred} for val, pred in zip(var_vals, var2vals["pred"])]
+                        [(maj_n_mean, maj_n_std)] = bootstrap_metric(
+                            data=vote_data,
+                            subset_size=n,
+                            reduce_fns=[partial(calc_maj_val, vote_key="pred", val_key="val")],
+                            seed=seed,
+                        )
+                        metric[f"maj@{n}/mean"], metric[f"maj@{n}/std"] = maj_n_mean, maj_n_std
+
+                data_src2prompt2var2metric[data_source][prompt][var_name] = metric
+
+    # Aggregate metrics across prompts
+    data_src2var2metric2prompt_vals = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for data_source, prompt2var2metric in data_src2prompt2var2metric.items():
+        for prompt, var2metric in prompt2var2metric.items():
+            for var_name, metric in var2metric.items():
+                for metric_name, metric_val in metric.items():
+                    data_src2var2metric2prompt_vals[data_source][var_name][metric_name].append(metric_val)
+
+    data_src2var2metric2val = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+    for data_source, var2metric2prompt_vals in data_src2var2metric2prompt_vals.items():
+        for var_name, metric2prompt_vals in var2metric2prompt_vals.items():
+            for metric_name, prompt_vals in metric2prompt_vals.items():
+                data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(prompt_vals)
+
+    return data_src2var2metric2val
+
+def calculate_average_accuracy_by_source(
+    data_sources: List[str],
+    infos_dict: Dict[str, List[Any]],
+    accuracy_key: str = "acc_score"
+) -> Dict[str, float]:
+    """
+    计算每个数据源下的平均准确率。
+
+    Args:
+        data_sources: 一个列表，其中每个元素是对应样本的数据源标识。
+        infos_dict: 一个字典，键是变量名（如 "acc", "loss"），值是每个样本对应的变量值列表。
+        accuracy_key: 在 infos_dict 中代表准确率的键名，默认为 "acc"。
+
+    Returns:
+        一个字典，键是数据源标识，值是该数据源下所有样本的平均准确率。
+        例如: {'source_1': 0.85, 'source_2': 0.92}
+    """
+    # 1. 按数据源分组，收集所有的准确率值
+    source_to_accuracies = defaultdict(list)
+    
+    # 确保 accuracy_key 存在于 infos_dict 中
+    if accuracy_key not in infos_dict:
+        raise KeyError(f"Accuracy key '{accuracy_key}' not found in infos_dict.")
+
+    # 遍历每个样本
+    for sample_idx, data_source in enumerate(data_sources):
+        # 获取当前样本的准确率
+        accuracy = infos_dict[accuracy_key][sample_idx]
+        # 将准确率添加到对应数据源的列表中
+        source_to_accuracies[data_source].append(accuracy)
+
+    # 2. 计算每个数据源的平均准确率
+    average_accuracy_by_source = {}
+    for data_source, accuracies in source_to_accuracies.items():
+        # 使用 numpy 计算平均值
+        average_accuracy_by_source[data_source] = np.mean(accuracies)
+
+    return average_accuracy_by_source
